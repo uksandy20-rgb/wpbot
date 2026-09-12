@@ -39,10 +39,10 @@ bot.action('STOP_PROCESS', (ctx) => {
   const session = userSessions[userId];
 
   if (session && session.process) {
-    if (session.logTimer) clearTimeout(session.logTimer);
+    if (session.logTimeout) clearTimeout(session.logTimeout);
     session.process.kill('SIGTERM');
     session.process = null;
-    ctx.reply('✅ Running process stopped successfully.', getMainMenu());
+    ctx.reply('🛑 Running process stopped successfully.', getMainMenu());
   } else {
     ctx.reply('⚠️ No active process running.', getMainMenu());
   }
@@ -120,7 +120,7 @@ bot.action('DELETE_ALL', async (ctx) => {
   const userDir = path.join(HOST_DIR, `user_${userId}`);
 
   if (userSessions[userId] && userSessions[userId].process) {
-    if (userSessions[userId].logTimer) clearTimeout(userSessions[userId].logTimer);
+    if (userSessions[userId].logTimeout) clearTimeout(userSessions[userId].logTimeout);
     userSessions[userId].process.kill('SIGTERM');
     userSessions[userId].process = null;
   }
@@ -179,7 +179,7 @@ bot.action(/^RUN_(.+)$/, async (ctx) => {
   session.state = 'RUNNING';
   userSessions[userId] = session;
 
-  ctx.reply(`🚀 Executing: \`node ${fileName}\` (Optimized for 1GB RAM)...\n`, { parse_mode: 'Markdown' });
+  ctx.reply(`🚀 Executing: \`node ${fileName}\` (Logs will show for the first 5 minutes)...`, { parse_mode: 'Markdown' });
   runProcess(ctx, userId);
 });
 
@@ -203,7 +203,7 @@ bot.on('message', async (ctx) => {
       await fs.ensureDir(userDir);
       
       if (session && session.process) {
-        if (session.logTimer) clearTimeout(session.logTimer);
+        if (session.logTimeout) clearTimeout(session.logTimeout);
         session.process.kill('SIGTERM');
         session.process = null;
       }
@@ -240,6 +240,17 @@ bot.on('message', async (ctx) => {
             env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=900' }
           });
 
+          // Send npm install output
+          npmInstaller.stdout.on('data', (data) => {
+            const text = data.toString().trim();
+            if (text) ctx.reply(`\`\`\`\n${text}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+          });
+
+          npmInstaller.stderr.on('data', (data) => {
+            const text = data.toString().trim();
+            if (text) ctx.reply(`⚠️ \`\`\`\n${text}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+          });
+
           npmInstaller.on('close', (code) => {
             if (code === 0) {
               ctx.reply('✅ Dependencies installed successfully!');
@@ -263,7 +274,7 @@ bot.on('message', async (ctx) => {
     session.command = command;
     session.state = 'RUNNING';
 
-    ctx.reply(`🚀 Starting process with command: \`${command}\` (Optimized for 1GB RAM)...\n`, { parse_mode: 'Markdown' });
+    ctx.reply(`🚀 Starting process with command: \`${command}\` (Logs will show for the first 5 minutes)...`, { parse_mode: 'Markdown' });
     runProcess(ctx, userId);
     return;
   }
@@ -280,7 +291,8 @@ function runProcess(ctx, userId) {
   const cmd = parts[0];
   const args = parts.slice(1);
 
-  // Set memory limit to 900MB to leave headroom for the panel itself inside 1GB total RAM
+  if (session.logTimeout) clearTimeout(session.logTimeout);
+
   const child = spawn(cmd, args, { 
     cwd: session.userDir, 
     shell: true,
@@ -288,6 +300,13 @@ function runProcess(ctx, userId) {
   });
   
   session.process = child;
+  let allowLogs = true;
+
+  // Stop sending logs automatically after 5 minutes (300,000 ms)
+  session.logTimeout = setTimeout(() => {
+    allowLogs = false;
+    ctx.reply('🔕 5 minutes have passed. Live logs are now muted to keep chat clean. The bot is running in the background.', getMainMenu()).catch(() => {});
+  }, 5 * 60 * 1000);
 
   let stdoutBuffer = '';
   let stderrBuffer = '';
@@ -295,7 +314,7 @@ function runProcess(ctx, userId) {
   let stderrTimer = null;
 
   const flushStdout = () => {
-    if (!stdoutBuffer.trim()) return;
+    if (!allowLogs || !stdoutBuffer.trim()) return;
     const text = stdoutBuffer.trim();
     const truncated = text.length > 3500 ? text.slice(-3500) : text;
     ctx.reply(`\`\`\`\n${truncated}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
@@ -303,7 +322,7 @@ function runProcess(ctx, userId) {
   };
 
   const flushStderr = () => {
-    if (!stderrBuffer.trim()) return;
+    if (!allowLogs || !stderrBuffer.trim()) return;
     const text = stderrBuffer.trim();
     const truncated = text.length > 3500 ? text.slice(-3500) : text;
     ctx.reply(`⚠️ **STDERR:**\n\`\`\`\n${truncated}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
@@ -311,16 +330,18 @@ function runProcess(ctx, userId) {
   };
 
   child.stdout.on('data', (data) => {
+    if (!allowLogs) return;
     stdoutBuffer += data.toString();
     if (!stdoutTimer) {
       stdoutTimer = setTimeout(() => {
         flushStdout();
         stdoutTimer = null;
-      }, 1500); // Send live logs grouped every 1.5 seconds
+      }, 1500);
     }
   });
 
   child.stderr.on('data', (data) => {
+    if (!allowLogs) return;
     stderrBuffer += data.toString();
     if (!stderrTimer) {
       stderrTimer = setTimeout(() => {
@@ -331,11 +352,11 @@ function runProcess(ctx, userId) {
   });
 
   child.on('close', (code) => {
+    if (session.logTimeout) clearTimeout(session.logTimeout);
     if (stdoutTimer) clearTimeout(stdoutTimer);
     if (stderrTimer) clearTimeout(stderrTimer);
-    flushStdout();
-    flushStderr();
-
+    
+    // Always show final output / exit status when it stops
     ctx.reply(`🏁 Process exited with code ${code}`, getMainMenu());
     if (userSessions[userId]) {
       userSessions[userId].state = 'IDLE';
@@ -351,4 +372,4 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Railway Host Alive\n');
 }).listen(PORT);
-       
+              
