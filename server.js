@@ -6,6 +6,7 @@ const unzipper = require('unzipper');
 const { spawn } = require('child_process');
 const http = require('http');
 
+// Replace with your Telegram Bot Token
 const BOT_TOKEN = '8687845093:AAHD_LFJSlTbFt3FkBKOffC6AzXjIaMzKCk';
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -13,6 +14,7 @@ const userSessions = {};
 const HOST_DIR = path.join(__dirname, 'hosted_apps');
 fs.ensureDirSync(HOST_DIR);
 
+// Main Navigation Keyboard
 function getMainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📦 Upload Zip & Host', 'UPLOAD_ZIP')],
@@ -21,22 +23,25 @@ function getMainMenu() {
   ]);
 }
 
+// Start Command
 bot.start((ctx) => {
   ctx.reply('Welcome to Node.js Host Bot! 🚀 Select an option:', getMainMenu());
 });
 
+// Callback: Trigger ZIP Upload State
 bot.action('UPLOAD_ZIP', (ctx) => {
   const userId = ctx.from.id;
   userSessions[userId] = { state: 'WAITING_FOR_ZIP' };
   ctx.reply('Please upload your project `.zip` file now.');
 });
 
+// Callback: Stop Active Running Process
 bot.action('STOP_PROCESS', (ctx) => {
   const userId = ctx.from.id;
   const session = userSessions[userId];
 
   if (session && session.process) {
-    session.process.kill();
+    session.process.kill('SIGTERM');
     session.process = null;
     ctx.reply('✅ Running process stopped successfully.', getMainMenu());
   } else {
@@ -44,6 +49,7 @@ bot.action('STOP_PROCESS', (ctx) => {
   }
 });
 
+// Callback: Open File Manager
 bot.action('MANAGE_FILES', async (ctx) => {
   const userId = ctx.from.id;
   const userDir = path.join(HOST_DIR, `user_${userId}`);
@@ -52,28 +58,51 @@ bot.action('MANAGE_FILES', async (ctx) => {
     return ctx.reply('📂 No files uploaded yet.', getMainMenu());
   }
 
-  showFileList(ctx, userDir);
+  await showFileList(ctx, userDir);
 });
 
+// Helper: Scan directory recursively to collect all .js files
+async function scanJsFiles(dir, baseDir = dir) {
+  let results = [];
+  const items = await fs.readdir(dir);
+
+  for (const item of items) {
+    const fullPath = path.join(dir, item);
+    const stat = await fs.stat(fullPath);
+
+    if (stat.isDirectory() && item !== 'node_modules') {
+      const subFiles = await scanJsFiles(fullPath, baseDir);
+      results = results.concat(subFiles);
+    } else if (item.endsWith('.js')) {
+      const relativePath = path.relative(baseDir, fullPath);
+      results.push({ name: item, relativePath, fullPath, dir: path.dirname(fullPath) });
+    }
+  }
+  return results;
+}
+
+// Dynamic File Menu Generator
 async function showFileList(ctx, userDir) {
   try {
     const files = await fs.readdir(userDir);
-    const jsFiles = files.filter((f) => f.endsWith('.js'));
+    const jsFiles = await scanJsFiles(userDir);
 
     if (files.length === 0) {
       return ctx.reply('📂 Directory is empty.', getMainMenu());
     }
 
     let buttons = [];
+
+    // Add execution buttons for each JavaScript file
     jsFiles.forEach((file) => {
-      buttons.push([Markup.button.callback(`▶️ Run ${file}`, `RUN_${file}`)]);
+      buttons.push([Markup.button.callback(`▶️ Run ${file.name}`, `RUN_${file.name}`)]);
     });
 
     buttons.push([Markup.button.callback('🗑️ Delete All Project Files', 'DELETE_ALL')]);
-    buttons.push([Markup.button.callback('🔙 Back to Menu', 'MAIN_MENU')]);
+    buttons.push([Markup.button.callback('🔙 Back to Main Menu', 'MAIN_MENU')]);
 
     const fileListText = files.map((f) => `• \`${f}\``).join('\n');
-    ctx.reply(`📂 **Project Files:**\n\n${fileListText}`, {
+    ctx.reply(`📂 **Uploaded Files & Actions:**\n\n${fileListText}`, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard(buttons)
     });
@@ -86,43 +115,65 @@ bot.action('MAIN_MENU', (ctx) => {
   ctx.reply('Main Menu:', getMainMenu());
 });
 
+// Callback: Delete All Files
 bot.action('DELETE_ALL', async (ctx) => {
   const userId = ctx.from.id;
   const userDir = path.join(HOST_DIR, `user_${userId}`);
 
   if (userSessions[userId] && userSessions[userId].process) {
-    userSessions[userId].process.kill();
+    userSessions[userId].process.kill('SIGTERM');
     userSessions[userId].process = null;
   }
 
   await fs.remove(userDir);
-  ctx.reply('🗑️ All uploaded files have been deleted.', getMainMenu());
+  ctx.reply('🗑️ All project files deleted cleanly.', getMainMenu());
 });
 
-bot.action(/^RUN_(.+)$/, (ctx) => {
+// Callback: Execute Specific Node File (Fixes Subfolder Path Errors)
+bot.action(/^RUN_(.+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const fileName = ctx.match[1];
   const userDir = path.join(HOST_DIR, `user_${userId}`);
 
+  let targetDir = userDir;
+  let targetFilePath = path.join(userDir, fileName);
+
+  // Deep search in nested folders if not directly in user root
+  if (!fs.existsSync(targetFilePath)) {
+    const allJsFiles = await scanJsFiles(userDir);
+    const matchedFile = allJsFiles.find((f) => f.name === fileName);
+
+    if (matchedFile) {
+      targetDir = matchedFile.dir;
+      targetFilePath = matchedFile.fullPath;
+    }
+  }
+
+  if (!fs.existsSync(targetFilePath)) {
+    return ctx.reply(`❌ Could not locate \`${fileName}\` in project directory.`, { parse_mode: 'Markdown' });
+  }
+
   const session = userSessions[userId] || {};
-  session.userDir = userDir;
+  session.userDir = targetDir;
   session.command = `node ${fileName}`;
   session.state = 'RUNNING';
   userSessions[userId] = session;
 
-  ctx.reply(`🚀 Executing: \`node ${fileName}\`...\n`, { parse_mode: 'Markdown' });
+  ctx.reply(`🚀 Starting: \`node ${fileName}\` inside \`${path.basename(targetDir)}\`...\n`, { parse_mode: 'Markdown' });
   runProcess(ctx, userId);
 });
 
+// Handle incoming ZIP uploads & interactive console input
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   let session = userSessions[userId];
 
+  // Process Document / ZIP Upload
   if (ctx.message.document && session && session.state === 'WAITING_FOR_ZIP') {
     const doc = ctx.message.document;
 
     if (!doc.file_name.endsWith('.zip')) {
-      return ctx.reply('❌ Please upload a valid `.zip` archive.');
+      return ctx.reply('❌ Please upload a valid `.zip` file.');
     }
 
     ctx.reply('📥 Downloading and extracting archive...');
@@ -144,6 +195,7 @@ bot.on('message', async (ctx) => {
         await fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: userDir })).promise();
         await fs.remove(zipPath);
 
+        // Auto-detect root path if files are nested inside a single subfolder
         let targetDir = userDir;
         let files = await fs.readdir(userDir);
         if (files.length === 1) {
@@ -156,9 +208,8 @@ bot.on('message', async (ctx) => {
 
         const packageJsonPath = path.join(targetDir, 'package.json');
         if (await fs.pathExists(packageJsonPath)) {
-          ctx.reply('📦 Starting `npm install` live stream...', { parse_mode: 'Markdown' });
+          ctx.reply('📦 Starting `npm install` (Live Stream)...', { parse_mode: 'Markdown' });
 
-          // Live spawn npm install process to stream installation logs
           const npmInstaller = spawn('npm', ['install', '--no-audit', '--no-fund'], {
             cwd: targetDir,
             shell: true
@@ -176,9 +227,9 @@ bot.on('message', async (ctx) => {
 
           npmInstaller.on('close', (code) => {
             if (code === 0) {
-              ctx.reply('✅ Dependencies installed successfully (`node_modules` created)!');
+              ctx.reply('✅ Dependencies installed successfully!');
             } else {
-              ctx.reply(`⚠️ \`npm install\` ended with exit code ${code}.`);
+              ctx.reply(`⚠️ \`npm install\` exited with code ${code}.`);
             }
             showFileList(ctx, targetDir);
           });
@@ -187,17 +238,19 @@ bot.on('message', async (ctx) => {
         }
       });
     } catch (err) {
-      ctx.reply(`❌ Error extraction failed: ${err.message}`);
+      ctx.reply(`❌ Extraction failed: ${err.message}`);
     }
     return;
   }
 
+  // Interactive STDIN Stream (Forward User Messages to Active Terminal Process)
   if (ctx.message.text && session && session.state === 'RUNNING' && session.process) {
     session.process.stdin.write(ctx.message.text + '\n');
     return;
   }
 });
 
+// Process Spawn Engine
 function runProcess(ctx, userId) {
   const session = userSessions[userId];
   const parts = session.command.split(' ');
@@ -218,7 +271,7 @@ function runProcess(ctx, userId) {
   });
 
   child.on('close', (code) => {
-    ctx.reply(`🏁 Process exited with code ${code}`, getMainMenu());
+    ctx.reply(`🏁 Process stopped with code ${code}`, getMainMenu());
     if (userSessions[userId]) {
       userSessions[userId].state = 'IDLE';
       userSessions[userId].process = null;
@@ -226,11 +279,12 @@ function runProcess(ctx, userId) {
   });
 }
 
-bot.launch().then(() => console.log('Telegram Bot running...'));
+bot.launch().then(() => console.log('Host Bot is online!'));
 
+// Railway Health-Check Server
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Server Active\n');
+  res.end('Railway Host Alive\n');
 }).listen(PORT);
-                                   
+        
