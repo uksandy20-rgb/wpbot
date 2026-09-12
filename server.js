@@ -4,7 +4,9 @@ const fs = require('fs-extra');
 const path = require('path');
 const unzipper = require('unzipper');
 const { spawn, exec } = require('child_process');
+const http = require('http');
 
+// Bot Token
 const BOT_TOKEN = '8687845093:AAHD_LFJSlTbFt3FkBKOffC6AzXjIaMzKCk';
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -12,6 +14,7 @@ const userSessions = {};
 const HOST_DIR = path.join(__dirname, 'hosted_apps');
 fs.ensureDirSync(HOST_DIR);
 
+// 1. Start Command & Inline Keyboard
 bot.start((ctx) => {
   ctx.reply(
     'Welcome to Node.js Telegram Host Bot! 🚀\nSelect an option below:',
@@ -41,11 +44,12 @@ bot.action('STOP_PROCESS', (ctx) => {
   }
 });
 
+// 2. Message Handler
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   let session = userSessions[userId];
 
-  // 1. Handle ZIP File Upload
+  // Handle ZIP File Upload
   if (ctx.message.document && session && session.state === 'WAITING_FOR_ZIP') {
     const doc = ctx.message.document;
 
@@ -72,14 +76,26 @@ bot.on('message', async (ctx) => {
         await fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: userDir })).promise();
         await fs.remove(zipPath);
 
-        session.userDir = userDir;
+        // Auto-detect root directory if files are nested inside a subfolder
+        let targetDir = userDir;
+        let files = await fs.readdir(userDir);
 
-        // AUTOMATIC NPM INSTALLATION CHECK
-        const packageJsonPath = path.join(userDir, 'package.json');
+        if (files.length === 1) {
+          const subFolderPath = path.join(userDir, files[0]);
+          const stat = await fs.stat(subFolderPath);
+          if (stat.isDirectory()) {
+            targetDir = subFolderPath; // Shift execution directory to nested subfolder
+          }
+        }
+
+        session.userDir = targetDir;
+
+        // Check & Install Dependencies Automatically
+        const packageJsonPath = path.join(targetDir, 'package.json');
         if (await fs.pathExists(packageJsonPath)) {
           ctx.reply('📦 `package.json` found! Automatically running `npm install`...', { parse_mode: 'Markdown' });
 
-          exec('npm install', { cwd: userDir }, (error, stdout, stderr) => {
+          exec('npm install', { cwd: targetDir }, (error, stdout, stderr) => {
             if (error) {
               ctx.reply(`❌ npm install failed:\n\`\`\`\n${stderr}\n\`\`\``, { parse_mode: 'Markdown' });
             } else {
@@ -98,19 +114,18 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  // 2. Handle Execution Command Input
+  // Handle Start Command Entry
   if (ctx.message.text && session && session.state === 'WAITING_FOR_COMMAND') {
     const command = ctx.message.text.trim();
     session.command = command;
     session.state = 'RUNNING';
 
     ctx.reply(`🚀 Starting process with command: \`${command}\`...\n`, { parse_mode: 'Markdown' });
-
     runProcess(ctx, userId);
     return;
   }
 
-  // 3. Forward User Inputs to Active Running Process
+  // Forward User Input Stream to Active Running Process
   if (ctx.message.text && session && session.state === 'RUNNING' && session.process) {
     const userInput = ctx.message.text;
     session.process.stdin.write(userInput + '\n');
@@ -126,6 +141,7 @@ function askForCommand(ctx, session) {
   );
 }
 
+// 3. Process Execution & Terminal Output Streaming
 function runProcess(ctx, userId) {
   const session = userSessions[userId];
   const parts = session.command.split(' ');
@@ -166,8 +182,17 @@ function runProcess(ctx, userId) {
   });
 }
 
-bot.launch().then(() => console.log('Bot is running on Telegram...'));
+// Connect Bot to Telegram
+bot.launch().then(() => console.log('Telegram Bot successfully connected!'));
+
+// 4. Railway Health Check Listener (Keeps Railway from crashing)
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Railway Host Server Active\n');
+}).listen(PORT, () => {
+  console.log(`Health check server running on port ${PORT}`);
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-  
