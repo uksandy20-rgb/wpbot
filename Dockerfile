@@ -1,7 +1,20 @@
-FROM node:18-alpine
+# Upgrade to Node 20 to satisfy package engine requirements
+FROM node:20-alpine
 
-# Install git and system build dependencies
-RUN apk add --no-cache git python3 make g++
+# Install git, python, build-base, and native canvas/graphics C++ dependencies
+RUN apk add --no-cache \
+    git \
+    python3 \
+    make \
+    g++ \
+    build-base \
+    cairo-dev \
+    pango-dev \
+    jpeg-dev \
+    giflib-dev \
+    librsvg-dev \
+    pixman-dev \
+    pkgconfig
 
 WORKDIR /app
 
