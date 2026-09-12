@@ -39,10 +39,10 @@ bot.action('STOP_PROCESS', (ctx) => {
   const session = userSessions[userId];
 
   if (session && session.process) {
-    if (session.logTimer) clearInterval(session.logTimer);
+    if (session.logTimer) clearTimeout(session.logTimer);
     session.process.kill('SIGTERM');
     session.process = null;
-    ctx.reply('🛑 Running process stopped successfully.', getMainMenu());
+    ctx.reply('✅ Running process stopped successfully.', getMainMenu());
   } else {
     ctx.reply('⚠️ No active process running.', getMainMenu());
   }
@@ -120,7 +120,7 @@ bot.action('DELETE_ALL', async (ctx) => {
   const userDir = path.join(HOST_DIR, `user_${userId}`);
 
   if (userSessions[userId] && userSessions[userId].process) {
-    if (userSessions[userId].logTimer) clearInterval(userSessions[userId].logTimer);
+    if (userSessions[userId].logTimer) clearTimeout(userSessions[userId].logTimer);
     userSessions[userId].process.kill('SIGTERM');
     userSessions[userId].process = null;
   }
@@ -179,7 +179,7 @@ bot.action(/^RUN_(.+)$/, async (ctx) => {
   session.state = 'RUNNING';
   userSessions[userId] = session;
 
-  ctx.reply(`🚀 Executing: \`node ${fileName}\` (Memory Limit: 2GB)...\n`, { parse_mode: 'Markdown' });
+  ctx.reply(`🚀 Executing: \`node ${fileName}\` (Optimized for 1GB RAM)...\n`, { parse_mode: 'Markdown' });
   runProcess(ctx, userId);
 });
 
@@ -203,7 +203,7 @@ bot.on('message', async (ctx) => {
       await fs.ensureDir(userDir);
       
       if (session && session.process) {
-        if (session.logTimer) clearInterval(session.logTimer);
+        if (session.logTimer) clearTimeout(session.logTimer);
         session.process.kill('SIGTERM');
         session.process = null;
       }
@@ -232,12 +232,12 @@ bot.on('message', async (ctx) => {
 
         const packageJsonPath = path.join(targetDir, 'package.json');
         if (await fs.pathExists(packageJsonPath)) {
-          ctx.reply('📦 Starting `npm install` (Silent Mode)...', { parse_mode: 'Markdown' });
+          ctx.reply('📦 Starting `npm install`...', { parse_mode: 'Markdown' });
 
           const npmInstaller = spawn('npm', ['install', '--no-audit', '--no-fund'], {
             cwd: targetDir,
             shell: true,
-            env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=2048' }
+            env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=900' }
           });
 
           npmInstaller.on('close', (code) => {
@@ -263,7 +263,7 @@ bot.on('message', async (ctx) => {
     session.command = command;
     session.state = 'RUNNING';
 
-    ctx.reply(`🚀 Starting process with command: \`${command}\` (Memory Limit: 2GB)...\n`, { parse_mode: 'Markdown' });
+    ctx.reply(`🚀 Starting process with command: \`${command}\` (Optimized for 1GB RAM)...\n`, { parse_mode: 'Markdown' });
     runProcess(ctx, userId);
     return;
   }
@@ -280,52 +280,66 @@ function runProcess(ctx, userId) {
   const cmd = parts[0];
   const args = parts.slice(1);
 
-  if (session.logTimer) clearInterval(session.logTimer);
-
+  // Set memory limit to 900MB to leave headroom for the panel itself inside 1GB total RAM
   const child = spawn(cmd, args, { 
     cwd: session.userDir, 
     shell: true,
-    env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=2048' }
+    env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=900' }
   });
   
   session.process = child;
-  session.logBuffer = '';
 
-  // Collect logs quietly in the background without spamming chat
+  let stdoutBuffer = '';
+  let stderrBuffer = '';
+  let stdoutTimer = null;
+  let stderrTimer = null;
+
+  const flushStdout = () => {
+    if (!stdoutBuffer.trim()) return;
+    const text = stdoutBuffer.trim();
+    const truncated = text.length > 3500 ? text.slice(-3500) : text;
+    ctx.reply(`\`\`\`\n${truncated}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+    stdoutBuffer = '';
+  };
+
+  const flushStderr = () => {
+    if (!stderrBuffer.trim()) return;
+    const text = stderrBuffer.trim();
+    const truncated = text.length > 3500 ? text.slice(-3500) : text;
+    ctx.reply(`⚠️ **STDERR:**\n\`\`\`\n${truncated}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+    stderrBuffer = '';
+  };
+
   child.stdout.on('data', (data) => {
-    session.logBuffer += data.toString();
-    if (session.logBuffer.length > 10000) {
-      session.logBuffer = session.logBuffer.slice(-10000); // Keep last 10KB
+    stdoutBuffer += data.toString();
+    if (!stdoutTimer) {
+      stdoutTimer = setTimeout(() => {
+        flushStdout();
+        stdoutTimer = null;
+      }, 1500); // Send live logs grouped every 1.5 seconds
     }
   });
 
   child.stderr.on('data', (data) => {
-    session.logBuffer += `[STDERR] ${data.toString()}`;
+    stderrBuffer += data.toString();
+    if (!stderrTimer) {
+      stderrTimer = setTimeout(() => {
+        flushStderr();
+        stderrTimer = null;
+      }, 1500);
+    }
   });
 
-  // Send accumulated log summary every 60 minutes automatically
-  session.logTimer = setInterval(() => {
-    if (session.logBuffer.trim()) {
-      const summary = session.logBuffer.length > 3500 ? session.logBuffer.slice(-3500) : session.logBuffer;
-      ctx.reply(`⏱️ **60-Minute Log Summary:**\n\`\`\`\n${summary}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
-      session.logBuffer = ''; // Reset buffer
-    }
-  }, 60 * 60 * 1000); // 60 minutes
-
   child.on('close', (code) => {
-    if (session.logTimer) clearInterval(session.logTimer);
-    
-    // Send final batch of remaining logs when stopping
-    if (session.logBuffer.trim()) {
-      const finalLogs = session.logBuffer.length > 3500 ? session.logBuffer.slice(-3500) : session.logBuffer;
-      ctx.reply(`📋 **Final Logs before exit:**\n\`\`\`\n${finalLogs}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
-    }
+    if (stdoutTimer) clearTimeout(stdoutTimer);
+    if (stderrTimer) clearTimeout(stderrTimer);
+    flushStdout();
+    flushStderr();
 
     ctx.reply(`🏁 Process exited with code ${code}`, getMainMenu());
     if (userSessions[userId]) {
       userSessions[userId].state = 'IDLE';
       userSessions[userId].process = null;
-      userSessions[userId].logBuffer = '';
     }
   });
 }
@@ -337,4 +351,4 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Railway Host Alive\n');
 }).listen(PORT);
-  
+       
