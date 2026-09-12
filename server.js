@@ -6,7 +6,6 @@ const unzipper = require('unzipper');
 const { spawn } = require('child_process');
 const http = require('http');
 
-// Replace with your Telegram Bot Token
 const BOT_TOKEN = '8687845093:AAHD_LFJSlTbFt3FkBKOffC6AzXjIaMzKCk';
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -14,7 +13,6 @@ const userSessions = {};
 const HOST_DIR = path.join(__dirname, 'hosted_apps');
 fs.ensureDirSync(HOST_DIR);
 
-// Main Navigation Keyboard
 function getMainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📦 Upload Zip & Host', 'UPLOAD_ZIP')],
@@ -23,19 +21,16 @@ function getMainMenu() {
   ]);
 }
 
-// Start Command
 bot.start((ctx) => {
   ctx.reply('Welcome to Node.js Host Bot! 🚀 Select an option:', getMainMenu());
 });
 
-// Callback: Trigger ZIP Upload State
 bot.action('UPLOAD_ZIP', (ctx) => {
   const userId = ctx.from.id;
   userSessions[userId] = { state: 'WAITING_FOR_ZIP' };
   ctx.reply('Please upload your project `.zip` file now.');
 });
 
-// Callback: Stop Active Running Process
 bot.action('STOP_PROCESS', (ctx) => {
   const userId = ctx.from.id;
   const session = userSessions[userId];
@@ -49,7 +44,6 @@ bot.action('STOP_PROCESS', (ctx) => {
   }
 });
 
-// Callback: Open File Manager
 bot.action('MANAGE_FILES', async (ctx) => {
   const userId = ctx.from.id;
   const userDir = path.join(HOST_DIR, `user_${userId}`);
@@ -61,7 +55,6 @@ bot.action('MANAGE_FILES', async (ctx) => {
   await showFileList(ctx, userDir);
 });
 
-// Helper: Scan directory recursively to collect all .js files
 async function scanJsFiles(dir, baseDir = dir) {
   let results = [];
   const items = await fs.readdir(dir);
@@ -81,7 +74,6 @@ async function scanJsFiles(dir, baseDir = dir) {
   return results;
 }
 
-// Dynamic File Menu Generator
 async function showFileList(ctx, userDir) {
   try {
     const files = await fs.readdir(userDir);
@@ -92,12 +84,11 @@ async function showFileList(ctx, userDir) {
     }
 
     let buttons = [];
-
-    // Add execution buttons for each JavaScript file
     jsFiles.forEach((file) => {
       buttons.push([Markup.button.callback(`▶️ Run ${file.name}`, `RUN_${file.name}`)]);
     });
 
+    buttons.push([Markup.button.callback('⚙️ Custom Command Prompt', 'ASK_CUSTOM_CMD')]);
     buttons.push([Markup.button.callback('🗑️ Delete All Project Files', 'DELETE_ALL')]);
     buttons.push([Markup.button.callback('🔙 Back to Main Menu', 'MAIN_MENU')]);
 
@@ -111,11 +102,14 @@ async function showFileList(ctx, userDir) {
   }
 }
 
+bot.action('ASK_CUSTOM_CMD', (ctx) => {
+  promptForCommand(ctx);
+});
+
 bot.action('MAIN_MENU', (ctx) => {
   ctx.reply('Main Menu:', getMainMenu());
 });
 
-// Callback: Delete All Files
 bot.action('DELETE_ALL', async (ctx) => {
   const userId = ctx.from.id;
   const userDir = path.join(HOST_DIR, `user_${userId}`);
@@ -129,7 +123,18 @@ bot.action('DELETE_ALL', async (ctx) => {
   ctx.reply('🗑️ All project files deleted cleanly.', getMainMenu());
 });
 
-// Callback: Execute Specific Node File (Fixes Subfolder Path Errors)
+// Prompt user for execution command
+function promptForCommand(ctx) {
+  const userId = ctx.from.id;
+  userSessions[userId] = userSessions[userId] || {};
+  userSessions[userId].state = 'WAITING_FOR_COMMAND';
+
+  ctx.reply(
+    '⌨️ **Please send your execution command now.**\n\nExamples:\n• `node index.js`\n• `npm start`\n• `python3 sms.py`',
+    { parse_mode: 'Markdown' }
+  );
+}
+
 bot.action(/^RUN_(.+)$/, async (ctx) => {
   const userId = ctx.from.id;
   const fileName = ctx.match[1];
@@ -138,7 +143,6 @@ bot.action(/^RUN_(.+)$/, async (ctx) => {
   let targetDir = userDir;
   let targetFilePath = path.join(userDir, fileName);
 
-  // Deep search in nested folders if not directly in user root
   if (!fs.existsSync(targetFilePath)) {
     const allJsFiles = await scanJsFiles(userDir);
     const matchedFile = allJsFiles.find((f) => f.name === fileName);
@@ -159,16 +163,15 @@ bot.action(/^RUN_(.+)$/, async (ctx) => {
   session.state = 'RUNNING';
   userSessions[userId] = session;
 
-  ctx.reply(`🚀 Starting: \`node ${fileName}\` inside \`${path.basename(targetDir)}\`...\n`, { parse_mode: 'Markdown' });
+  ctx.reply(`🚀 Executing: \`node ${fileName}\`...\n`, { parse_mode: 'Markdown' });
   runProcess(ctx, userId);
 });
 
-// Handle incoming ZIP uploads & interactive console input
 bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   let session = userSessions[userId];
 
-  // Process Document / ZIP Upload
+  // ZIP Upload Handler
   if (ctx.message.document && session && session.state === 'WAITING_FOR_ZIP') {
     const doc = ctx.message.document;
 
@@ -195,7 +198,6 @@ bot.on('message', async (ctx) => {
         await fs.createReadStream(zipPath).pipe(unzipper.Extract({ path: userDir })).promise();
         await fs.remove(zipPath);
 
-        // Auto-detect root path if files are nested inside a single subfolder
         let targetDir = userDir;
         let files = await fs.readdir(userDir);
         if (files.length === 1) {
@@ -231,10 +233,10 @@ bot.on('message', async (ctx) => {
             } else {
               ctx.reply(`⚠️ \`npm install\` exited with code ${code}.`);
             }
-            showFileList(ctx, targetDir);
+            promptForCommand(ctx); // Prompt user for custom command directly after npm install
           });
         } else {
-          showFileList(ctx, targetDir);
+          promptForCommand(ctx);
         }
       });
     } catch (err) {
@@ -243,14 +245,24 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  // Interactive STDIN Stream (Forward User Messages to Active Terminal Process)
+  // Handle Command Submission
+  if (ctx.message.text && session && session.state === 'WAITING_FOR_COMMAND') {
+    const command = ctx.message.text.trim();
+    session.command = command;
+    session.state = 'RUNNING';
+
+    ctx.reply(`🚀 Starting process with command: \`${command}\`...\n`, { parse_mode: 'Markdown' });
+    runProcess(ctx, userId);
+    return;
+  }
+
+  // Interactive Live Input Forwarder
   if (ctx.message.text && session && session.state === 'RUNNING' && session.process) {
     session.process.stdin.write(ctx.message.text + '\n');
     return;
   }
 });
 
-// Process Spawn Engine
 function runProcess(ctx, userId) {
   const session = userSessions[userId];
   const parts = session.command.split(' ');
@@ -271,7 +283,7 @@ function runProcess(ctx, userId) {
   });
 
   child.on('close', (code) => {
-    ctx.reply(`🏁 Process stopped with code ${code}`, getMainMenu());
+    ctx.reply(`🏁 Process exited with code ${code}`, getMainMenu());
     if (userSessions[userId]) {
       userSessions[userId].state = 'IDLE';
       userSessions[userId].process = null;
@@ -281,10 +293,9 @@ function runProcess(ctx, userId) {
 
 bot.launch().then(() => console.log('Host Bot is online!'));
 
-// Railway Health-Check Server
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Railway Host Alive\n');
 }).listen(PORT);
-        
+           
