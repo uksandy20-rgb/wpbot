@@ -13,6 +13,9 @@ const userSessions = {};
 const HOST_DIR = path.join(__dirname, 'hosted_apps');
 fs.ensureDirSync(HOST_DIR);
 
+// Folders/files that should NEVER be deleted automatically
+const PROTECTED_PATHS = ['session', 'auth_info_baileys', 'state', 'auth', 'creds.json'];
+
 function getMainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('📦 Upload Zip & Host', 'UPLOAD_ZIP')],
@@ -57,6 +60,7 @@ bot.action('MANAGE_FILES', async (ctx) => {
 
 async function scanJsFiles(dir, baseDir = dir) {
   let results = [];
+  if (!fs.existsSync(dir)) return results;
   const items = await fs.readdir(dir);
 
   for (const item of items) {
@@ -120,19 +124,30 @@ bot.action('DELETE_ALL', async (ctx) => {
   }
 
   await fs.remove(userDir);
-  ctx.reply('🗑️ All project files deleted cleanly.', getMainMenu());
+  ctx.reply('🗑️ All project files (including session data) deleted cleanly.', getMainMenu());
 });
 
-// Prompt user for execution command
 function promptForCommand(ctx) {
   const userId = ctx.from.id;
   userSessions[userId] = userSessions[userId] || {};
   userSessions[userId].state = 'WAITING_FOR_COMMAND';
 
   ctx.reply(
-    '⌨️ **Please send your execution command now.**\n\nExamples:\n• `node index.js`\n• `npm start`\n• `python3 sms.py`',
+    '⌨️ **Please send your execution command now.**\n\nExamples:\n• `node index.js`\n• `npm start`',
     { parse_mode: 'Markdown' }
   );
+}
+
+// Safely clear old application files while preserving WhatsApp authentication sessions
+async function safeCleanUserDirectory(userDir) {
+  if (!(await fs.pathExists(userDir))) return;
+
+  const items = await fs.readdir(userDir);
+  for (const item of items) {
+    if (!PROTECTED_PATHS.includes(item) && item !== 'node_modules') {
+      await fs.remove(path.join(userDir, item));
+    }
+  }
 }
 
 bot.action(/^RUN_(.+)$/, async (ctx) => {
@@ -171,7 +186,7 @@ bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   let session = userSessions[userId];
 
-  // ZIP Upload Handler
+  // Handle ZIP upload without deleting existing WhatsApp auth files
   if (ctx.message.document && session && session.state === 'WAITING_FOR_ZIP') {
     const doc = ctx.message.document;
 
@@ -179,14 +194,22 @@ bot.on('message', async (ctx) => {
       return ctx.reply('❌ Please upload a valid `.zip` file.');
     }
 
-    ctx.reply('📥 Downloading and extracting archive...');
+    ctx.reply('📥 Downloading and extracting archive (Preserving Auth Files)...');
 
     try {
       const fileLink = await ctx.telegram.getFileLink(doc.file_id);
       const userDir = path.join(HOST_DIR, `user_${userId}`);
 
-      await fs.remove(userDir);
       await fs.ensureDir(userDir);
+      
+      // Stop running process if active
+      if (session && session.process) {
+        session.process.kill('SIGTERM');
+        session.process = null;
+      }
+
+      // Safely delete code files while preserving 'session', 'auth', 'creds.json'
+      await safeCleanUserDirectory(userDir);
 
       const response = await axios({ url: fileLink.href, responseType: 'stream' });
       const zipPath = path.join(userDir, 'app.zip');
@@ -233,7 +256,7 @@ bot.on('message', async (ctx) => {
             } else {
               ctx.reply(`⚠️ \`npm install\` exited with code ${code}.`);
             }
-            promptForCommand(ctx); // Prompt user for custom command directly after npm install
+            promptForCommand(ctx);
           });
         } else {
           promptForCommand(ctx);
@@ -245,7 +268,6 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  // Handle Command Submission
   if (ctx.message.text && session && session.state === 'WAITING_FOR_COMMAND') {
     const command = ctx.message.text.trim();
     session.command = command;
@@ -256,7 +278,6 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  // Interactive Live Input Forwarder
   if (ctx.message.text && session && session.state === 'RUNNING' && session.process) {
     session.process.stdin.write(ctx.message.text + '\n');
     return;
@@ -298,4 +319,3 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Railway Host Alive\n');
 }).listen(PORT);
-           
