@@ -1,0 +1,18 @@
+{
+  "name": "telegram-host-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for running and interacting with Node.js zips",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "fs-extra": "^11.2.0",
+    "telegraf": "^4.16.3",
+    "unzipper": "^0.10.14"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
