@@ -39,9 +39,10 @@ bot.action('STOP_PROCESS', (ctx) => {
   const session = userSessions[userId];
 
   if (session && session.process) {
+    if (session.logTimer) clearInterval(session.logTimer);
     session.process.kill('SIGTERM');
     session.process = null;
-    ctx.reply('✅ Running process stopped successfully.', getMainMenu());
+    ctx.reply('🛑 Running process stopped successfully.', getMainMenu());
   } else {
     ctx.reply('⚠️ No active process running.', getMainMenu());
   }
@@ -119,6 +120,7 @@ bot.action('DELETE_ALL', async (ctx) => {
   const userDir = path.join(HOST_DIR, `user_${userId}`);
 
   if (userSessions[userId] && userSessions[userId].process) {
+    if (userSessions[userId].logTimer) clearInterval(userSessions[userId].logTimer);
     userSessions[userId].process.kill('SIGTERM');
     userSessions[userId].process = null;
   }
@@ -138,7 +140,6 @@ function promptForCommand(ctx) {
   );
 }
 
-// Safely clear old application files while preserving WhatsApp authentication sessions
 async function safeCleanUserDirectory(userDir) {
   if (!(await fs.pathExists(userDir))) return;
 
@@ -178,7 +179,7 @@ bot.action(/^RUN_(.+)$/, async (ctx) => {
   session.state = 'RUNNING';
   userSessions[userId] = session;
 
-  ctx.reply(`🚀 Executing: \`node ${fileName}\`...\n`, { parse_mode: 'Markdown' });
+  ctx.reply(`🚀 Executing: \`node ${fileName}\` (Memory Limit: 2GB)...\n`, { parse_mode: 'Markdown' });
   runProcess(ctx, userId);
 });
 
@@ -186,7 +187,6 @@ bot.on('message', async (ctx) => {
   const userId = ctx.from.id;
   let session = userSessions[userId];
 
-  // Handle ZIP upload without deleting existing WhatsApp auth files
   if (ctx.message.document && session && session.state === 'WAITING_FOR_ZIP') {
     const doc = ctx.message.document;
 
@@ -202,13 +202,12 @@ bot.on('message', async (ctx) => {
 
       await fs.ensureDir(userDir);
       
-      // Stop running process if active
       if (session && session.process) {
+        if (session.logTimer) clearInterval(session.logTimer);
         session.process.kill('SIGTERM');
         session.process = null;
       }
 
-      // Safely delete code files while preserving 'session', 'auth', 'creds.json'
       await safeCleanUserDirectory(userDir);
 
       const response = await axios({ url: fileLink.href, responseType: 'stream' });
@@ -233,28 +232,19 @@ bot.on('message', async (ctx) => {
 
         const packageJsonPath = path.join(targetDir, 'package.json');
         if (await fs.pathExists(packageJsonPath)) {
-          ctx.reply('📦 Starting `npm install` (Live Stream)...', { parse_mode: 'Markdown' });
+          ctx.reply('📦 Starting `npm install` (Silent Mode)...', { parse_mode: 'Markdown' });
 
           const npmInstaller = spawn('npm', ['install', '--no-audit', '--no-fund'], {
             cwd: targetDir,
-            shell: true
-          });
-
-          npmInstaller.stdout.on('data', (data) => {
-            const output = data.toString().trim();
-            if (output) ctx.reply(`\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
-          });
-
-          npmInstaller.stderr.on('data', (data) => {
-            const output = data.toString().trim();
-            if (output) ctx.reply(`⚠️ \`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+            shell: true,
+            env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=2048' }
           });
 
           npmInstaller.on('close', (code) => {
             if (code === 0) {
               ctx.reply('✅ Dependencies installed successfully!');
             } else {
-              ctx.reply(`⚠️ \`npm install\` exited with code ${code}.`);
+              ctx.reply(`⚠️ \`npm install\` finished with code ${code}.`);
             }
             promptForCommand(ctx);
           });
@@ -273,7 +263,7 @@ bot.on('message', async (ctx) => {
     session.command = command;
     session.state = 'RUNNING';
 
-    ctx.reply(`🚀 Starting process with command: \`${command}\`...\n`, { parse_mode: 'Markdown' });
+    ctx.reply(`🚀 Starting process with command: \`${command}\` (Memory Limit: 2GB)...\n`, { parse_mode: 'Markdown' });
     runProcess(ctx, userId);
     return;
   }
@@ -290,24 +280,52 @@ function runProcess(ctx, userId) {
   const cmd = parts[0];
   const args = parts.slice(1);
 
-  const child = spawn(cmd, args, { cwd: session.userDir, shell: true });
-  session.process = child;
+  if (session.logTimer) clearInterval(session.logTimer);
 
+  const child = spawn(cmd, args, { 
+    cwd: session.userDir, 
+    shell: true,
+    env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=2048' }
+  });
+  
+  session.process = child;
+  session.logBuffer = '';
+
+  // Collect logs quietly in the background without spamming chat
   child.stdout.on('data', (data) => {
-    const output = data.toString().trim();
-    if (output) ctx.reply(`\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+    session.logBuffer += data.toString();
+    if (session.logBuffer.length > 10000) {
+      session.logBuffer = session.logBuffer.slice(-10000); // Keep last 10KB
+    }
   });
 
   child.stderr.on('data', (data) => {
-    const output = data.toString().trim();
-    if (output) ctx.reply(`⚠️ **STDERR:**\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+    session.logBuffer += `[STDERR] ${data.toString()}`;
   });
 
+  // Send accumulated log summary every 60 minutes automatically
+  session.logTimer = setInterval(() => {
+    if (session.logBuffer.trim()) {
+      const summary = session.logBuffer.length > 3500 ? session.logBuffer.slice(-3500) : session.logBuffer;
+      ctx.reply(`⏱️ **60-Minute Log Summary:**\n\`\`\`\n${summary}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+      session.logBuffer = ''; // Reset buffer
+    }
+  }, 60 * 60 * 1000); // 60 minutes
+
   child.on('close', (code) => {
+    if (session.logTimer) clearInterval(session.logTimer);
+    
+    // Send final batch of remaining logs when stopping
+    if (session.logBuffer.trim()) {
+      const finalLogs = session.logBuffer.length > 3500 ? session.logBuffer.slice(-3500) : session.logBuffer;
+      ctx.reply(`📋 **Final Logs before exit:**\n\`\`\`\n${finalLogs}\n\`\`\``, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+
     ctx.reply(`🏁 Process exited with code ${code}`, getMainMenu());
     if (userSessions[userId]) {
       userSessions[userId].state = 'IDLE';
       userSessions[userId].process = null;
+      userSessions[userId].logBuffer = '';
     }
   });
 }
@@ -319,3 +337,4 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Railway Host Alive\n');
 }).listen(PORT);
+  
